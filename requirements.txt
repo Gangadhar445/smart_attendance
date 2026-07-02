@@ -1,20 +1,13 @@
-# Face recognition & image processing
 face-recognition
 face-recognition-models
+dlib
 opencv-python
 numpy
-
-# Web framework & server
 fastapi
 uvicorn
-
-# Templates & forms
 jinja2
 python-multipart
-
-# Data handling & analytics
 pandas
 plotly
-
-# CLI table formatting
 tabulate
+setuptools==68.2.2
