@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Attendance Dashboard</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .metrics { display: flex; gap: 30px; margin-bottom: 20px; }
+        .metric { background: #f0f0f0; padding: 20px; border-radius: 8px; width: 200px; text-align: center; }
+        table { border-collapse: collapse; width: 60%; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+        th { background: #4CAF50; color: white; }
+        input { margin-bottom: 20px; padding: 6px; width: 200px; }
+        button { padding: 6px 12px; margin-left: 10px; cursor: pointer; }
+        #heatmap td { transition: background 0.3s; }
+    </style>
+</head>
+<body>
+    <h1>Real-time Attendance Dashboard</h1>
+
+    <div class="metrics">
+        <div class="metric">
+            <h3>Total Students</h3>
+            <p id="total_students">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Attendance</h3>
+            <p id="today_attendance">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Absent</h3>
+            <p id="today_absent">0</p>
+        </div>
+        <div class="metric">
+            <button id="refreshBtn">Refresh Dashboard</button>
+        </div>
+    </div>
+
+    <h2>Search Student</h2>
+    <input type="text" id="searchBox" placeholder="Type student name...">
+
+    <h2>Attendance % per Student</h2>
+    <table id="attendance_table">
+        <tr>
+            <th>Student</th>
+            <th>Attendance %</th>
+        </tr>
+    </table>
+
+    <h2>Top Engaged Students</h2>
+    <p>Total Attendance Days Taken: <span id="total_days">0</span></p>
+    <table id="engage_table">
+        <tr>
+            <th>Student</th>
+            <th>Total Classes Attended</th>
+        </tr>
+    </table>
+
+    <h2>Attendance Heatmap (Students vs Dates)</h2>
+    <table id="heatmap">
+        <tr id="heatmap_header"></tr>
+    </table>
+
+<script>
+async function fetchData() {
+    const response = await fetch('/attendance');
+    const data = await response.json();
+
+    document.getElementById('total_students').innerText = data.total_students;
+    document.getElementById('today_attendance').innerText = data.today_attendance;
+    document.getElementById('today_absent').innerText = data.today_absent;
+
+    // Update table: Attendance %
+    const table = document.getElementById('attendance_table');
+    table.innerHTML = "<tr><th>Student</th><th>Attendance %</th></tr>";
+    for (const [student, percent] of Object.entries(data.attendance_percentage)) {
+        const row = table.insertRow();
+        row.insertCell(0).innerText = student;
+        row.insertCell(1).innerText = percent.toFixed(2) + "%";
+    }
+
+    // Render Top Engaged Students table
+    const engageTable = document.getElementById('engage_table');
+    engageTable.innerHTML = "<tr><th>Student</th><th>Total Classes Attended</th></tr>";
+    for (let i = 0; i < data.engage_json.students.length; i++) {
+        const row = engageTable.insertRow();
+        row.insertCell(0).innerText = data.engage_json.students[i];
+        row.insertCell(1).innerText = data.engage_json.counts[i];
+    }
+
+    // Update total days
+    document.getElementById('total_days').innerText = data.engage_json.total_days;
+
+    // Heatmap rendering
+    const heatmap = document.getElementById('heatmap');
+    heatmap.innerHTML = "";
+    if(data.heatmap_dates && data.heatmap_matrix) {
+        const headerRow = document.createElement('tr');
+        const emptyHeader = document.createElement('th');
+        emptyHeader.innerText = "Student / Date";
+        headerRow.appendChild(emptyHeader);
+        data.heatmap_dates.forEach(date => {
+            const th = document.createElement('th');
+            th.innerText = date;
+            headerRow.appendChild(th);
+        });
+        heatmap.appendChild(headerRow);
+
+        for (let i = 0; i < data.heatmap_students.length; i++) {
+            const row = document.createElement('tr');
+            const nameCell = document.createElement('td');
+            nameCell.innerText = data.heatmap_students[i];
+            row.appendChild(nameCell);
+
+            data.heatmap_matrix[i].forEach(val => {
+                const cell = document.createElement('td');
+                cell.innerText = val ? "✔" : "✖";
+                cell.style.background = val ? "#c8e6c9" : "#ffcdd2";
+                row.appendChild(cell);
+            });
+            heatmap.appendChild(row);
+        }
+    }
+}
+
+// Initial fetch
+fetchData();
+
+// Manual refresh button
+document.getElementById('refreshBtn').addEventListener('click', fetchData);
+
+// Search filter
+document.getElementById('searchBox').addEventListener('input', function() {
+    const filter = this.value.toLowerCase();
+    const rows = document.querySelectorAll("#attendance_table tr:not(:first-child)");
+    rows.forEach(row => {
+        const name = row.cells[0].innerText.toLowerCase();
+        row.style.display = name.includes(filter) ? "" : "none";
+    });
+});
+</script>
+</body>
+</html>

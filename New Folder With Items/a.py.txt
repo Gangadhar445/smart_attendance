@@ -1,0 +1,431 @@
+import os
+import io
+import cv2
+import csv
+import time
+import difflib
+import face_recognition
+import numpy as np
+from datetime import datetime
+import threading
+import pandas as pd
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+import uvicorn
+
+# -------------------------
+# Config / Paths
+# -------------------------
+DATASET_PATH = "dataset"
+ATTENDANCE_FILE = "attendance.csv"
+TEMPLATES_DIR = "templates"                 # optional: place dashboard_realtime.html here
+ENCODING_MODEL = "hog"                      # 'hog' (CPU) or 'cnn' (GPU/dlib-cuda)
+
+# Ensure dataset and attendance file exist
+os.makedirs(DATASET_PATH, exist_ok=True)
+if not os.path.exists(ATTENDANCE_FILE):
+    with open(ATTENDANCE_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Name", "Date", "Time"])
+
+# Global memory for encodings
+student_encodings = []
+student_names = []
+
+
+# -------------------------
+# Helpers: Dataset load / Attendance
+# -------------------------
+def load_dataset():
+    """Load known faces from DATASET_PATH into memory (student_encodings, student_names)."""
+    global student_encodings, student_names
+    student_encodings = []
+    student_names = []
+    if not os.path.exists(DATASET_PATH):
+        print(f"[WARN] Dataset folder '{DATASET_PATH}' missing. Create folders named per person with images.")
+        return
+
+    for person in os.listdir(DATASET_PATH):
+        person_folder = os.path.join(DATASET_PATH, person)
+        if not os.path.isdir(person_folder):
+            continue
+        for fname in os.listdir(person_folder):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            img_path = os.path.join(person_folder, fname)
+            try:
+                image = face_recognition.load_image_file(img_path)
+                boxes = face_recognition.face_locations(image, model=ENCODING_MODEL)
+                encs = face_recognition.face_encodings(image, boxes)
+                if encs:
+                    student_encodings.append(encs[0])
+                    student_names.append(person)
+            except Exception as e:
+                print(f"[WARN] Failed to process {img_path}: {e}")
+    print(f"[INFO] Loaded {len(student_names)} known face images.")
+
+
+def mark_attendance(name: str) -> bool:
+    """Add attendance entry for today's date if not already present for the name."""
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+
+    # Read existing entries
+    entries = []
+    try:
+        with open(ATTENDANCE_FILE, "r", newline="") as f:
+            reader = csv.reader(f)
+            entries = list(reader)
+    except Exception:
+        entries = []
+
+    # Skip header if present; check duplicates
+    for row in entries[1:]:
+        if len(row) >= 2 and row[0] == name and row[1] == date_str:
+            return False  # already present today
+
+    # Append new row
+    with open(ATTENDANCE_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([name, date_str, time_str])
+    print(f"[MARKED] {name} at {time_str}")
+    return True
+
+
+# Initial dataset load
+load_dataset()
+
+
+# -------------------------
+# Registration (auto-capture after single 'c' press) with duplicate/similarity checks
+# -------------------------
+def normalize_name(s: str) -> str:
+    return "".join(s.lower().split())
+
+
+def get_existing_names():
+    """Return list of folder names in DATASET_PATH (existing registered names)."""
+    if not os.path.exists(DATASET_PATH):
+        return []
+    return [n for n in os.listdir(DATASET_PATH) if os.path.isdir(os.path.join(DATASET_PATH, n))]
+
+
+def register_student_interactive():
+    """
+    Interactive registration with duplicate/similarity checks.
+    - Prevents exact duplicate names (case-insensitive).
+    - Warns when similar names exist and asks for confirmation.
+    - Press 'c' once in the preview window to START automatic capture of max_shots images.
+    - Press 'q' to cancel at any time.
+    """
+    existing_names = get_existing_names()
+    existing_norm = {normalize_name(n): n for n in existing_names}
+
+    # Name input loop
+    while True:
+        name = input("Enter student name: ").strip()
+        if not name:
+            print("[INFO] Name empty. Aborting registration.")
+            return
+
+        # exact duplicate (normalized) check
+        if normalize_name(name) in existing_norm:
+            print(f"[WARN] A similar/exact name already exists: '{existing_norm[normalize_name(name)]}'")
+            choice = input("Enter 'r' to retry with a different name, or 'a' to abort: ").strip().lower()
+            if choice == "r":
+                continue
+            else:
+                print("[INFO] Registration aborted.")
+                return
+
+        # fuzzy similarity suggestions
+        suggestions = difflib.get_close_matches(name, existing_names, n=3, cutoff=0.75)
+        if suggestions:
+            print("[WARN] Similar names found in dataset:")
+            for s in suggestions:
+                print("  -", s)
+            confirm = input("Proceed with this new name anyway? (y/N) ").strip().lower()
+            if confirm != "y":
+                print("[INFO] Please enter a different name.")
+                continue  # ask for name again
+
+        # accepted name
+        break
+
+    person_dir = os.path.join(DATASET_PATH, name)
+    os.makedirs(person_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Cannot open camera for registration.")
+        return
+
+    max_shots = 5         # total images to capture
+    delay_between = 0.6   # seconds between captures
+    capturing = False
+    captured = 0
+
+    print("[INFO] Registration preview started.")
+    print(f"[INFO] Name to register: {name}")
+    print(f" - Press 'c' once to start auto-capture of {max_shots} images. Press 'q' to cancel.")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            disp = frame.copy()
+            if not capturing:
+                cv2.putText(disp, "Press 'c' to START auto-capture | 'q' to cancel",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                cv2.putText(disp, f"Capturing... {captured}/{max_shots}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            cv2.imshow("Register Student (auto-capture)", disp)
+            key = cv2.waitKey(1) & 0xFF
+
+            if not capturing and key == ord("c"):
+                capturing = True
+                captured = 0
+                print("[INFO] Auto-capture started...")
+                # automatic capture loop
+                while captured < max_shots:
+                    ret2, frame2 = cap.read()
+                    if not ret2:
+                        continue
+                    timestamp = int(time.time() * 1000)
+                    fname = f"{name}_{timestamp}_{captured}.jpg"
+                    out_path = os.path.join(person_dir, fname)
+                    cv2.imwrite(out_path, frame2)
+                    captured += 1
+                    print(f"[SAVED] {captured}/{max_shots}: {out_path}")
+
+                    # small responsive wait so user can cancel with 'q'
+                    waited_ms = 0
+                    wait_ms_total = int(delay_between * 1000)
+                    while waited_ms < wait_ms_total:
+                        k = cv2.waitKey(1) & 0xFF
+                        if k == ord("q"):
+                            print("[INFO] Registration cancelled by user during auto-capture.")
+                            capturing = False
+                            break
+                        time.sleep(0.01)
+                        waited_ms += 10
+
+                    if not capturing:
+                        break
+
+                if captured >= max_shots:
+                    print("[INFO] Auto-capture complete.")
+                else:
+                    print("[INFO] Auto-capture stopped early.")
+                break  # leave outer preview loop after auto-capture (or cancel)
+
+            elif key == ord("q"):
+                print("[INFO] Registration cancelled by user.")
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    # Reload dataset if images were saved
+    if os.path.exists(person_dir) and len(os.listdir(person_dir)) > 0:
+        load_dataset()
+        print(f"[INFO] Registered '{name}' with {len(os.listdir(person_dir))} images.")
+    else:
+        print("[INFO] No images saved. Registration aborted or incomplete.")
+
+
+# -------------------------
+# FastAPI Dashboard & Endpoints
+# -------------------------
+app = FastAPI()
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+
+def load_attendance_df():
+    try:
+        df = pd.read_csv(ATTENDANCE_FILE)
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=['Name', 'Date', 'Time'])
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
+    template_file = os.path.join(TEMPLATES_DIR, "dashboard_realtime.html")
+    if os.path.exists(template_file):
+        return templates.TemplateResponse("dashboard_realtime.html", {"request": request})
+    else:
+        df = load_attendance_df()
+        if df.empty:
+            html = "<h3>No attendance data yet.</h3>"
+        else:
+            df2 = df.copy()
+            df2['Date'] = df2['Date'].dt.strftime('%Y-%m-%d')
+            html_table = df2.to_html(index=False)
+            html = f"<h3>Attendance Data</h3>{html_table}"
+        return HTMLResponse(f"<html><body>{html}</body></html>")
+
+
+@app.get("/attendance")
+def attendance_data():
+    df = load_attendance_df()
+    if df.empty:
+        return JSONResponse({
+            "total_students": 0,
+            "today_attendance": 0,
+            "today_absent": 0,
+            "attendance_percentage": {},
+            "engage_json": {},
+            "heatmap_matrix": [],
+            "heatmap_students": [],
+            "heatmap_dates": []
+        })
+
+    total_students = int(df['Name'].nunique())
+    today = pd.Timestamp.now().normalize()
+    # today filtering using date strings is safer
+    df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d')
+    today_str = today.strftime('%Y-%m-%d')
+    today_present_students = df[df['Date_str'] == today_str]['Name'].unique().tolist()
+    today_attendance = len(today_present_students)
+    today_absent = max(total_students - today_attendance, 0)
+
+    # Attendance % per student
+    unique_dates = sorted(df['Date_str'].unique())
+    attendance_percentage = {}
+    for student in df['Name'].unique():
+        count = len(df[df['Name'] == student])
+        attendance_percentage[student] = (count / len(unique_dates)) * 100 if len(unique_dates) > 0 else 0
+
+    # Top Engaged Students as table data
+    engagement = df['Name'].value_counts().reset_index()
+    engagement.columns = ['Name', 'Attendance Count']
+    engage_json = {
+        "students": engagement['Name'].tolist(),
+        "counts": engagement['Attendance Count'].tolist(),
+        "total_days": len(unique_dates)
+    }
+
+    # Heatmap matrix
+    heatmap_students = sorted(df['Name'].unique().tolist())
+    heatmap_dates = unique_dates
+    heatmap_matrix = []
+    for student in heatmap_students:
+        row = []
+        for d in heatmap_dates:
+            present = not df[(df['Name'] == student) & (df['Date_str'] == d)].empty
+            row.append(1 if present else 0)
+        heatmap_matrix.append(row)
+
+    return JSONResponse({
+        "total_students": total_students,
+        "today_attendance": today_attendance,
+        "today_absent": today_absent,
+        "attendance_percentage": attendance_percentage,
+        "engage_json": engage_json,
+        "heatmap_matrix": heatmap_matrix,
+        "heatmap_students": heatmap_students,
+        "heatmap_dates": heatmap_dates
+    })
+
+
+@app.post("/reload")
+def reload_encodings():
+    load_dataset()
+    return {"status": "ok", "known_faces": len(student_names)}
+
+
+def run_dashboard():
+    # Run uvicorn server for the FastAPI app
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+
+
+# -------------------------
+# Face recognition main loop (webcam)
+# -------------------------
+def face_recognition_loop():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Camera not available.")
+        return
+
+    print("Starting Attendance System (webcam). Press 'r' to register, 'q' to quit.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+        boxes = face_recognition.face_locations(rgb_small, model=ENCODING_MODEL)
+        encs = face_recognition.face_encodings(rgb_small, boxes)
+
+        unknown_present = False
+
+        for enc, box in zip(encs, boxes):
+            if len(student_encodings) == 0:
+                name = "Unknown"
+                unknown_present = True
+            else:
+                matches = face_recognition.compare_faces(student_encodings, enc, tolerance=0.5)
+                distances = face_recognition.face_distance(student_encodings, enc)
+                name = "Unknown"
+                if True in matches:
+                    best_idx = np.argmin(distances)
+                    name = student_names[best_idx]
+                    mark_attendance(name)
+                else:
+                    unknown_present = True
+
+            # scale box coords back up (we used 1/4 scale)
+            top, right, bottom, left = [v * 4 for v in box]
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
+            cv2.putText(
+                frame,
+                name,
+                (left + 6, bottom - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+
+        cv2.imshow("Attendance System", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            if unknown_present:
+                print("[INFO] Registration triggered (interactive). Please enter name in terminal.")
+                register_student_interactive()
+            else:
+                print("[INFO] No unknown face detected. Cannot register.")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# -------------------------
+# Main: run dashboard thread + webcam loop
+# -------------------------
+if __name__ == "__main__":
+    # Start FastAPI dashboard in a daemon thread so the main process can run webcam loop
+    dash_thread = threading.Thread(target=run_dashboard, daemon=True)
+    dash_thread.start()
+
+    # Run the main webcam attendance loop in main thread
+    face_recognition_loop()
+
+    print("[INFO] Exiting program. Dashboard will stop as process ends.")

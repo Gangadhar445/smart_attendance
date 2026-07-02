@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Attendance Dashboard</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .controls { margin-bottom: 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+        .metrics { display: flex; gap: 30px; margin-bottom: 20px; }
+        .metric { background: #f0f0f0; padding: 20px; border-radius: 8px; width: 200px; text-align: center; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+        th { background: #4CAF50; color: white; }
+        input, select { padding: 6px; margin-right: 8px; }
+        button { padding: 6px 12px; margin-right: 8px; cursor: pointer; }
+        #heatmap td { transition: background 0.3s; }
+        #session_info { margin-left: 12px; font-weight: bold; }
+        .small { font-size: 12px; color: #555; }
+        .status { margin-left: 8px; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <h1>Real-time Attendance Dashboard</h1>
+
+    <div class="controls">
+        <label for="class_minutes">Class duration (minutes):</label>
+        <input type="number" id="class_minutes" min="1" value="50">
+        <button id="start_class">Start Class</button>
+        <button id="stop_class" disabled>Stop Class</button>
+
+        <label for="cam_select" style="margin-left:20px">Camera:</label>
+        <select id="cam_select"></select>
+        <button id="switch_btn">Switch</button>
+        <button id="probe_btn">Re-probe</button>
+
+        <button id="refreshBtn" style="margin-left:20px">Refresh Dashboard</button>
+
+        <span id="session_info" class="status">No active session</span>
+    </div>
+
+    <div class="metrics">
+        <div class="metric">
+            <h3>Total Students</h3>
+            <p id="total_students">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Attendance</h3>
+            <p id="today_attendance">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Absent</h3>
+            <p id="today_absent">0</p>
+        </div>
+        <div class="metric small">
+            <p>Interval scheme: 6 partitions. Threshold: 65% (rounded up).</p>
+        </div>
+    </div>
+
+    <h2>Search Student</h2>
+    <input type="text" id="searchBox" placeholder="Type student name...">
+
+    <h2>Attendance % per Student</h2>
+    <table id="attendance_table">
+        <tr>
+            <th>Student</th>
+            <th>Attendance %</th>
+        </tr>
+    </table>
+
+    <h2>Top Engaged Students</h2>
+    <p>Total Attendance Days Taken: <span id="total_days">0</span></p>
+    <table id="engage_table">
+        <tr>
+            <th>Student</th>
+            <th>Total Classes Attended</th>
+        </tr>
+    </table>
+
+    <h2>Interval Heatmap (current session)</h2>
+    <div id="session_controls" class="small"></div>
+    <table id="session_heatmap"></table>
+
+<script>
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+async function fetchAttendance() {
+    try {
+        const data = await fetchJSON('/attendance');
+        document.getElementById('total_students').innerText = data.total_students ?? 0;
+        document.getElementById('today_attendance').innerText = data.today_attendance ?? 0;
+        document.getElementById('today_absent').innerText = data.today_absent ?? 0;
+
+        const table = document.getElementById('attendance_table');
+        table.innerHTML = "<tr><th>Student</th><th>Attendance %</th></tr>";
+        if (data.attendance_percentage) {
+          for (const [student, percent] of Object.entries(data.attendance_percentage)) {
+              const row = table.insertRow();
+              row.insertCell(0).innerText = student;
+              row.insertCell(1).innerText = (percent || 0).toFixed(2) + "%";
+          }
+        }
+
+        const engageTable = document.getElementById('engage_table');
+        engageTable.innerHTML = "<tr><th>Student</th><th>Total Classes Attended</th></tr>";
+        if (data.engage_json && data.engage_json.students) {
+          for (let i = 0; i < data.engage_json.students.length; i++) {
+              const row = engageTable.insertRow();
+              row.insertCell(0).innerText = data.engage_json.students[i];
+              row.insertCell(1).innerText = data.engage_json.counts[i];
+          }
+          document.getElementById('total_days').innerText = data.engage_json.total_days ?? 0;
+        } else {
+          document.getElementById('total_days').innerText = 0;
+        }
+    } catch (err) {
+        console.error("fetchAttendance:", err);
+    }
+}
+
+async function fetchCams() {
+  try {
+    const data = await fetchJSON('/cameras');
+    const sel = document.getElementById('cam_select');
+    sel.innerHTML = '';
+    (data.cameras || []).forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.index;
+      opt.text = c.name;
+      sel.appendChild(opt);
+    });
+    if (typeof data.current !== 'undefined' && sel.options.length > 0) {
+      sel.value = data.current;
+      const si = document.getElementById('session_info');
+      if (si.innerText.startsWith('No active')) {
+        si.innerText = 'Camera: ' + (data.cameras.find(x=>x.index==data.current)?.name || data.current);
+      }
+    } else {
+      document.getElementById('session_info').innerText = 'No cameras detected';
+    }
+  } catch (e) {
+    console.error("fetchCams error:", e);
+    document.getElementById('session_info').innerText = 'Error fetching cameras';
+  }
+}
+
+async function switchCam() {
+  const sel = document.getElementById('cam_select');
+  if (!sel.value) return alert('No camera selected');
+  const idx = sel.value;
+  try {
+    const data = await fetchJSON('/camera/' + idx, { method: 'POST' });
+    document.getElementById('session_info').innerText = 'Switched: ' + (data.camera_name || data.camera_index);
+    await fetchCams();
+  } catch (e) {
+    alert('Switch failed: ' + e);
+  }
+}
+
+async function reprobe() {
+  try {
+    const data = await fetchJSON('/cameras/probe', { method: 'POST' });
+    document.getElementById('session_info').innerText = 'Reprobe success';
+    await fetchCams();
+  } catch (e) {
+    alert('Reprobe failed: ' + e);
+  }
+}
+
+/* Session controls */
+let sessionPollInterval = null;
+
+async function startClass() {
+  const duration = parseFloat(document.getElementById('class_minutes').value || '50');
+  try {
+    const data = await fetchJSON('/class/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({duration_min: duration})
+    });
+    if (!data.session_id) throw new Error('no session id returned');
+    document.getElementById('start_class').disabled = true;
+    document.getElementById('stop_class').disabled = false;
+    document.getElementById('session_info').innerText = 'Class started: ' + data.session_id;
+    await fetchCams();
+    await loadCurrentSession();
+    startSessionPolling();
+  } catch (e) {
+    alert('Start failed: ' + e);
+    console.error(e);
+  }
+}
+
+async function stopClass() {
+  try {
+    const data = await fetchJSON('/class/stop', { method: 'POST' });
+    document.getElementById('start_class').disabled = false;
+    document.getElementById('stop_class').disabled = true;
+    document.getElementById('session_info').innerText = 'Class stopped';
+    stopSessionPolling();
+    await loadCurrentSession();
+    // refresh attendance & cams
+    await fetchAttendance();
+    await fetchCams();
+  } catch (e) {
+    alert('Stop failed: ' + e);
+  }
+}
+
+async function loadCurrentSession() {
+  try {
+    const cur = await fetchJSON('/class/current');
+    if (!cur.active) {
+      document.getElementById('session_info').innerText = 'No active session';
+      document.getElementById('start_class').disabled = false;
+      document.getElementById('stop_class').disabled = true;
+      renderSessionHeatmap(null);
+      return;
+    }
+    const sid = cur.session_id;
+    document.getElementById('session_info').innerText = `Session ${sid} | intervals=${cur.intervals} interval_min=${cur.interval_min.toFixed(2)}m start=${cur.start_iso}`;
+    document.getElementById('start_class').disabled = true;
+    document.getElementById('stop_class').disabled = false;
+    const summary = await fetchJSON('/class/' + sid + '/summary');
+    renderSessionHeatmap(summary);
+  } catch (e) {
+    console.error('loadCurrentSession', e);
+  }
+}
+
+function renderSessionHeatmap(summary) {
+  const table = document.getElementById('session_heatmap');
+  table.innerHTML = '';
+  if (!summary) {
+    table.innerHTML = '<tr><td>No active session.</td></tr>';
+    return;
+  }
+  const hdr = table.insertRow();
+  const th0 = document.createElement('th');
+  th0.innerText = 'Student';
+  hdr.appendChild(th0);
+  for (let i=0;i<summary.intervals;i++){
+    const th = document.createElement('th'); th.innerText = 'I'+(i+1); hdr.appendChild(th);
+  }
+  const thLast = document.createElement('th'); thLast.innerText = 'Final'; hdr.appendChild(thLast);
+
+  const names = Object.keys(summary.summary).sort();
+  names.forEach(name => {
+    const row = table.insertRow();
+    const cellName = row.insertCell();
+    cellName.innerText = name;
+    const info = summary.summary[name];
+    (info.intervals || []).forEach(val => {
+      const c = row.insertCell();
+      c.innerText = val ? '✔' : '✖';
+      c.style.background = val ? '#c8e6c9' : '#ffcdd2';
+    });
+    const finalCell = row.insertCell();
+    finalCell.innerText = info.present ? 'Present' : 'Absent';
+    finalCell.style.fontWeight = 'bold';
+    finalCell.style.color = info.present ? 'green' : 'red';
+  });
+}
+
+/* Polling */
+function startSessionPolling() {
+  if (sessionPollInterval) return;
+  sessionPollInterval = setInterval(async () => {
+    try {
+      const cur = await fetchJSON('/class/current');
+      if (!cur.active) {
+        stopSessionPolling();
+        renderSessionHeatmap(null);
+        return;
+      }
+      const summary = await fetchJSON('/class/' + cur.session_id + '/summary');
+      renderSessionHeatmap(summary);
+      fetchAttendance();
+    } catch (e) {
+      console.error('session poll error', e);
+    }
+  }, 3000);
+}
+
+function stopSessionPolling() {
+  if (sessionPollInterval) {
+    clearInterval(sessionPollInterval);
+    sessionPollInterval = null;
+  }
+}
+
+/* Bindings */
+document.getElementById('switch_btn').addEventListener('click', switchCam);
+document.getElementById('probe_btn').addEventListener('click', reprobe);
+document.getElementById('start_class').addEventListener('click', startClass);
+document.getElementById('stop_class').addEventListener('click', stopClass);
+document.getElementById('refreshBtn').addEventListener('click', async () => {
+    await fetchAttendance();
+    await fetchCams();
+    await loadCurrentSession();
+});
+
+fetchAttendance();
+fetchCams();
+loadCurrentSession();
+setInterval(fetchAttendance, 5000);
+
+document.getElementById('searchBox').addEventListener('input', function() {
+    const filter = this.value.toLowerCase();
+    const rows = document.querySelectorAll("#attendance_table tr:not(:first-child)");
+    rows.forEach(row => {
+        const name = row.cells[0].innerText.toLowerCase();
+        row.style.display = name.includes(filter) ? "" : "none";
+    });
+});
+</script>
+</body>
+</html>

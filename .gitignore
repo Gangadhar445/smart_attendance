@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+attendance.csv
+interval_attendance.csv
+sessions.json
+camera_names.json
+
+
+dataset/*
+!dataset/.gitkeep

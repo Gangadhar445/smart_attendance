@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Attendance Dashboard</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .metrics { display: flex; gap: 30px; margin-bottom: 20px; }
+        .metric { background: #f0f0f0; padding: 20px; border-radius: 8px; width: 200px; text-align: center; }
+        table { border-collapse: collapse; width: 60%; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+        th { background: #4CAF50; color: white; }
+        input { margin-bottom: 20px; padding: 6px; width: 200px; }
+        button { padding: 6px 12px; margin-left: 10px; cursor: pointer; }
+        #heatmap td { transition: background 0.3s; }
+        .controls { margin-bottom: 16px; }
+        select, input[type=text] { padding: 6px; margin-right: 8px; }
+        #camera_status { margin-top: 8px; color: #333; }
+    </style>
+</head>
+<body>
+    <h1>Real-time Attendance Dashboard</h1>
+
+    <div class="controls">
+      <label for="cam_select">Camera:</label>
+      <select id="cam_select"></select>
+      <button id="switch_btn">Switch</button>
+
+      <button id="probe_btn">Re-probe</button>
+
+      <button id="refreshBtn" style="margin-left:20px">Refresh Dashboard</button>
+
+      <span id="camera_status" style="margin-left:12px"></span>
+    </div>
+
+    <div class="metrics">
+        <div class="metric">
+            <h3>Total Students</h3>
+            <p id="total_students">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Attendance</h3>
+            <p id="today_attendance">0</p>
+        </div>
+        <div class="metric">
+            <h3>Today's Absent</h3>
+            <p id="today_absent">0</p>
+        </div>
+        <div class="metric">
+            <p style="font-size:12px;color:#666">Click <strong>Refresh Dashboard</strong> to reload attendance & camera list</p>
+        </div>
+    </div>
+
+    <h2>Search Student</h2>
+    <input type="text" id="searchBox" placeholder="Type student name...">
+
+    <h2>Attendance % per Student</h2>
+    <table id="attendance_table">
+        <tr>
+            <th>Student</th>
+            <th>Attendance %</th>
+        </tr>
+    </table>
+
+    <h2>Top Engaged Students</h2>
+    <p>Total Attendance Days Taken: <span id="total_days">0</span></p>
+    <table id="engage_table">
+        <tr>
+            <th>Student</th>
+            <th>Total Classes Attended</th>
+        </tr>
+    </table>
+
+    <h2>Attendance Heatmap (Students vs Dates)</h2>
+    <table id="heatmap">
+        <tr id="heatmap_header"></tr>
+    </table>
+
+<script>
+/* ---------- Attendance fetch/update ---------- */
+async function fetchAttendance() {
+    try {
+        const response = await fetch('/attendance');
+        const data = await response.json();
+
+        document.getElementById('total_students').innerText = data.total_students ?? 0;
+        document.getElementById('today_attendance').innerText = data.today_attendance ?? 0;
+        document.getElementById('today_absent').innerText = data.today_absent ?? 0;
+
+        // Update table: Attendance %
+        const table = document.getElementById('attendance_table');
+        table.innerHTML = "<tr><th>Student</th><th>Attendance %</th></tr>";
+        if (data.attendance_percentage) {
+          for (const [student, percent] of Object.entries(data.attendance_percentage)) {
+              const row = table.insertRow();
+              row.insertCell(0).innerText = student;
+              row.insertCell(1).innerText = (percent || 0).toFixed(2) + "%";
+          }
+        }
+
+        // Render Top Engaged Students table
+        const engageTable = document.getElementById('engage_table');
+        engageTable.innerHTML = "<tr><th>Student</th><th>Total Classes Attended</th></tr>";
+        if (data.engage_json && data.engage_json.students) {
+          for (let i = 0; i < data.engage_json.students.length; i++) {
+              const row = engageTable.insertRow();
+              row.insertCell(0).innerText = data.engage_json.students[i];
+              row.insertCell(1).innerText = data.engage_json.counts[i];
+          }
+          document.getElementById('total_days').innerText = data.engage_json.total_days ?? 0;
+        } else {
+          document.getElementById('total_days').innerText = 0;
+        }
+
+        // Heatmap rendering
+        const heatmap = document.getElementById('heatmap');
+        heatmap.innerHTML = "";
+        if(data.heatmap_dates && data.heatmap_matrix) {
+            const headerRow = document.createElement('tr');
+            const emptyHeader = document.createElement('th');
+            emptyHeader.innerText = "Student / Date";
+            headerRow.appendChild(emptyHeader);
+            data.heatmap_dates.forEach(date => {
+                const th = document.createElement('th');
+                th.innerText = date;
+                headerRow.appendChild(th);
+            });
+            heatmap.appendChild(headerRow);
+
+            for (let i = 0; i < data.heatmap_students.length; i++) {
+                const row = document.createElement('tr');
+                const nameCell = document.createElement('td');
+                nameCell.innerText = data.heatmap_students[i];
+                row.appendChild(nameCell);
+
+                data.heatmap_matrix[i].forEach(val => {
+                    const cell = document.createElement('td');
+                    cell.innerText = val ? "✔" : "✖";
+                    cell.style.background = val ? "#c8e6c9" : "#ffcdd2";
+                    row.appendChild(cell);
+                });
+                heatmap.appendChild(row);
+            }
+        }
+    } catch (err) {
+        console.error("Failed to fetch /attendance:", err);
+        document.getElementById('total_students').innerText = "?";
+    }
+}
+
+/* ---------- Camera controls (manual refresh only) ---------- */
+async function fetchCams() {
+  try {
+    const res = await fetch('/cameras');
+    const data = await res.json();
+    const sel = document.getElementById('cam_select');
+    sel.innerHTML = '';
+    (data.cameras || []).forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.index;
+      opt.text = c.name + " (" + c.index + ")";
+      sel.appendChild(opt);
+    });
+    if (typeof data.current !== 'undefined' && sel.options.length > 0) {
+      sel.value = data.current;
+      document.getElementById('camera_status').innerText = 'Current: ' + (data.cameras.find(x=>x.index==data.current)?.name || data.current);
+    } else {
+      document.getElementById('camera_status').innerText = 'No cameras detected';
+    }
+  } catch (e) {
+    console.error("fetchCams error:", e);
+    document.getElementById('camera_status').innerText = 'Error fetching cameras';
+  }
+}
+
+async function switchCam() {
+  const sel = document.getElementById('cam_select');
+  if (!sel.value) return alert('No camera selected');
+  const idx = sel.value;
+  const res = await fetch('/camera/' + idx, { method: 'POST' });
+  const data = await res.json();
+  document.getElementById('camera_status').innerText = 'Switched: ' + (data.camera_name || data.camera_index);
+  await fetchCams();
+}
+
+async function reprobe() {
+  const res = await fetch('/cameras/probe', { method: 'POST' });
+  const data = await res.json();
+  document.getElementById('camera_status').innerText = 'Reprobe: success';
+  await fetchCams();
+}
+
+/* ---------- Init and bindings ---------- */
+document.getElementById('refreshBtn').addEventListener('click', () => {
+    fetchAttendance();
+    fetchCams();
+});
+
+document.getElementById('switch_btn').addEventListener('click', switchCam);
+document.getElementById('probe_btn').addEventListener('click', reprobe);
+
+// Initial load: fetch attendance and camera list once at page load
+fetchAttendance();
+fetchCams();
+
+// Attendance still auto-refreshes (optional)
+setInterval(fetchAttendance, 5000);
+
+// Camera auto-refresh REMOVED
+
+// Search filter
+document.getElementById('searchBox').addEventListener('input', function() {
+    const filter = this.value.toLowerCase();
+    const rows = document.querySelectorAll("#attendance_table tr:not(:first-child)");
+    rows.forEach(row => {
+        const name = row.cells[0].innerText.toLowerCase();
+        row.style.display = name.includes(filter) ? "" : "none";
+    });
+});
+</script>
+</body>
+</html>

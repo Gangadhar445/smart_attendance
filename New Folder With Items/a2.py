@@ -1,0 +1,613 @@
+"""
+attend.py
+
+Face Recognition Attendance System (modified):
+- Camera probing & friendly names retained
+- Removed rename feature (no /cameras/rename endpoint)
+- Re-probe only runs when POST /cameras/probe is called (manual via dashboard)
+- No periodic reprobe thread
+"""
+import os
+import io
+import cv2
+import csv
+import time
+import json
+import difflib
+import face_recognition
+import numpy as np
+from datetime import datetime
+import threading
+import pandas as pd
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+import uvicorn
+
+# -------------------------
+# Config / Paths
+# -------------------------
+DATASET_PATH = "dataset"
+ATTENDANCE_FILE = "attendance.csv"
+TEMPLATES_DIR = "templates"
+ENCODING_MODEL = "hog"                      # 'hog' (CPU) or 'cnn' (GPU/dlib-cuda)
+CAMERA_NAMES_FILE = "camera_names.json"
+PROBE_MAX = 6                               # how many indices to probe (0..PROBE_MAX-1)
+
+# Ensure dataset and attendance file exist
+os.makedirs(DATASET_PATH, exist_ok=True)
+if not os.path.exists(ATTENDANCE_FILE):
+    with open(ATTENDANCE_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Name", "Date", "Time"])
+
+# Global memory for encodings
+student_encodings = []
+student_names = []
+
+# -------------------------
+# Helpers: Dataset load / Attendance
+# -------------------------
+def load_dataset():
+    """Load known faces from DATASET_PATH into memory (student_encodings, student_names)."""
+    global student_encodings, student_names
+    student_encodings = []
+    student_names = []
+    if not os.path.exists(DATASET_PATH):
+        print(f"[WARN] Dataset folder '{DATASET_PATH}' missing. Create folders named per person with images.")
+        return
+
+    for person in os.listdir(DATASET_PATH):
+        person_folder = os.path.join(DATASET_PATH, person)
+        if not os.path.isdir(person_folder):
+            continue
+        for fname in os.listdir(person_folder):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            img_path = os.path.join(person_folder, fname)
+            try:
+                image = face_recognition.load_image_file(img_path)
+                boxes = face_recognition.face_locations(image, model=ENCODING_MODEL)
+                encs = face_recognition.face_encodings(image, boxes)
+                if encs:
+                    student_encodings.append(encs[0])
+                    student_names.append(person)
+            except Exception as e:
+                print(f"[WARN] Failed to process {img_path}: {e}")
+    print(f"[INFO] Loaded {len(student_names)} known face images.")
+
+
+def mark_attendance(name: str) -> bool:
+    """Add attendance entry for today's date if not already present for the name."""
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+
+    # Read existing entries
+    entries = []
+    try:
+        with open(ATTENDANCE_FILE, "r", newline="") as f:
+            reader = csv.reader(f)
+            entries = list(reader)
+    except Exception:
+        entries = []
+
+    # Skip header if present; check duplicates
+    for row in entries[1:]:
+        if len(row) >= 2 and row[0] == name and row[1] == date_str:
+            return False  # already present today
+
+    # Append new row
+    with open(ATTENDANCE_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([name, date_str, time_str])
+    print(f"[MARKED] {name} at {time_str}")
+    return True
+
+
+# Initial dataset load
+load_dataset()
+
+# -------------------------
+# Camera manager with probing & friendly names (no rename endpoint)
+# -------------------------
+class CameraManager:
+    """
+    Thread-safe camera manager with probe and friendly-name support.
+    - Probes indices 0..probe_max-1 to find available cameras
+    - Persists friendly names to CAMERA_NAMES_FILE (optional)
+    """
+    def __init__(self, start_index=0, probe_max=PROBE_MAX):
+        self.lock = threading.Lock()
+        self.index = int(start_index)
+        self.capture = None
+        self.probe_max = probe_max
+        self.available = self.probe_cameras()
+        self.names = self.load_camera_names()
+        for idx in self.available:
+            if str(idx) not in self.names:
+                self.names[str(idx)] = f"Camera {idx}"
+        # pick a valid start index
+        if self.index not in self.available:
+            self.index = self.available[0] if self.available else 0
+        self.open(self.index)
+        self.save_camera_names()
+
+    def probe_cameras(self):
+        found = []
+        for i in range(self.probe_max):
+            cap = cv2.VideoCapture(i)
+            time.sleep(0.12)
+            ok, _ = cap.read()
+            try:
+                cap.release()
+            except Exception:
+                pass
+            if ok:
+                found.append(i)
+        print(f"[CAM] Probed available cameras: {found}")
+        return found
+
+    def load_camera_names(self):
+        if os.path.exists(CAMERA_NAMES_FILE):
+            try:
+                with open(CAMERA_NAMES_FILE, "r") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def save_camera_names(self):
+        try:
+            with open(CAMERA_NAMES_FILE, "w") as f:
+                json.dump(self.names, f, indent=2)
+        except Exception as e:
+            print("[CAM] Warning saving camera names:", e)
+
+    def open(self, index):
+        index = int(index)
+        with self.lock:
+            try:
+                if self.capture is not None:
+                    try:
+                        self.capture.release()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            cap = cv2.VideoCapture(index)
+            time.sleep(0.2)
+            if not cap.isOpened():
+                print(f"[CAM] Unable to open camera {index}")
+                # fallback: try first available
+                if self.available:
+                    fallback = self.available[0]
+                    if fallback != index:
+                        print(f"[CAM] Falling back to camera {fallback}")
+                        cap0 = cv2.VideoCapture(fallback)
+                        time.sleep(0.2)
+                        if cap0.isOpened():
+                            self.capture = cap0
+                            self.index = fallback
+                            return True
+                self.capture = None
+                return False
+            else:
+                self.capture = cap
+                self.index = index
+                if index not in self.available:
+                    self.available.append(index)
+                print(f"[CAM] Camera switched to index {index}")
+                return True
+
+    def read(self):
+        with self.lock:
+            if self.capture is None:
+                return False, None
+            ret, frame = self.capture.read()
+            return ret, frame
+
+    def release(self):
+        with self.lock:
+            try:
+                if self.capture is not None:
+                    self.capture.release()
+            except Exception:
+                pass
+            self.capture = None
+
+    def get_index(self):
+        with self.lock:
+            return self.index
+
+    def get_available(self):
+        return list(self.available)
+
+    def get_name(self, index):
+        return self.names.get(str(index), f"Camera {index}")
+
+    # Note: set_name is intentionally not used (rename removed)
+
+    def reprobe(self):
+        """
+        Re-scan camera indices and update the available list.
+        If current camera disappears, automatically switch to the first available.
+        Returns the new available list.
+        """
+        with self.lock:
+            new_found = []
+            for i in range(self.probe_max):
+                cap = cv2.VideoCapture(i)
+                time.sleep(0.12)
+                ok, _ = cap.read()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                if ok:
+                    new_found.append(i)
+
+            self.available = new_found
+
+            # Ensure names exist for newly found indices
+            for idx in self.available:
+                if str(idx) not in self.names:
+                    self.names[str(idx)] = f"Camera {idx}"
+
+            # If current index disappeared, switch to first available
+            if self.index not in self.available:
+                if self.available:
+                    first = self.available[0]
+                    print(f"[CAM] Current camera {self.index} disappeared; switching to {first}")
+                    try:
+                        self.open(first)
+                    except Exception as e:
+                        print("[CAM] reprobe: failed to open fallback camera:", e)
+                else:
+                    print("[CAM] No cameras found after reprobe.")
+                    try:
+                        if self.capture is not None:
+                            self.capture.release()
+                    except Exception:
+                        pass
+                    self.capture = None
+
+            self.save_camera_names()
+            return list(self.available)
+
+
+# create camera manager (probes up to PROBE_MAX indices)
+CAM = CameraManager(start_index=0, probe_max=PROBE_MAX)
+
+# -------------------------
+# Registration (auto-capture) using CAM
+# -------------------------
+def normalize_name(s: str) -> str:
+    return "".join(s.lower().split())
+
+def get_existing_names():
+    if not os.path.exists(DATASET_PATH):
+        return []
+    return [n for n in os.listdir(DATASET_PATH) if os.path.isdir(os.path.join(DATASET_PATH, n))]
+
+def register_student_interactive():
+    existing_names = get_existing_names()
+    existing_norm = {normalize_name(n): n for n in existing_names}
+
+    while True:
+        name = input("Enter student name: ").strip()
+        if not name:
+            print("[INFO] Name empty. Aborting registration.")
+            return
+
+        if normalize_name(name) in existing_norm:
+            print(f"[WARN] A similar/exact name already exists: '{existing_norm[normalize_name(name)]}'")
+            choice = input("Enter 'r' to retry with a different name, or 'a' to abort: ").strip().lower()
+            if choice == "r":
+                continue
+            else:
+                print("[INFO] Registration aborted.")
+                return
+
+        suggestions = difflib.get_close_matches(name, existing_names, n=3, cutoff=0.75)
+        if suggestions:
+            print("[WARN] Similar names found in dataset:")
+            for s in suggestions:
+                print("  -", s)
+            confirm = input("Proceed with this new name anyway? (y/N) ").strip().lower()
+            if confirm != "y":
+                print("[INFO] Please enter a different name.")
+                continue
+
+        break
+
+    person_dir = os.path.join(DATASET_PATH, name)
+    os.makedirs(person_dir, exist_ok=True)
+
+    max_shots = 5
+    delay_between = 0.6
+    capturing = False
+    captured = 0
+
+    print("[INFO] Registration preview started using camera index", CAM.get_index())
+    print(f"[INFO] Name to register: {name}")
+    print(f" - Press 'c' once to start auto-capture of {max_shots} images. Press 'q' to cancel.")
+
+    try:
+        while True:
+            ret, frame = CAM.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+
+            disp = frame.copy()
+            if not capturing:
+                cv2.putText(disp, "Press 'c' to START auto-capture | 'q' to cancel",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                cv2.putText(disp, f"Capturing... {captured}/{max_shots}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            cv2.imshow("Register Student (auto-capture)", disp)
+            key = cv2.waitKey(1) & 0xFF
+
+            if not capturing and key == ord("c"):
+                capturing = True
+                captured = 0
+                print("[INFO] Auto-capture started...")
+                while captured < max_shots:
+                    ret2, frame2 = CAM.read()
+                    if not ret2:
+                        time.sleep(0.02)
+                        continue
+                    timestamp = int(time.time() * 1000)
+                    fname = f"{name}_{timestamp}_{captured}.jpg"
+                    out_path = os.path.join(person_dir, fname)
+                    cv2.imwrite(out_path, frame2)
+                    captured += 1
+                    print(f"[SAVED] {captured}/{max_shots}: {out_path}")
+
+                    waited_ms = 0
+                    wait_ms_total = int(delay_between * 1000)
+                    while waited_ms < wait_ms_total:
+                        k = cv2.waitKey(1) & 0xFF
+                        if k == ord("q"):
+                            print("[INFO] Registration cancelled by user during auto-capture.")
+                            capturing = False
+                            break
+                        time.sleep(0.01)
+                        waited_ms += 10
+
+                    if not capturing:
+                        break
+
+                if captured >= max_shots:
+                    print("[INFO] Auto-capture complete.")
+                else:
+                    print("[INFO] Auto-capture stopped early.")
+                break
+
+            elif key == ord("q"):
+                print("[INFO] Registration cancelled by user.")
+                break
+
+    finally:
+        cv2.destroyAllWindows()
+
+    if os.path.exists(person_dir) and len(os.listdir(person_dir)) > 0:
+        load_dataset()
+        print(f"[INFO] Registered '{name}' with {len(os.listdir(person_dir))} images.")
+    else:
+        print("[INFO] No images saved. Registration aborted or incomplete.")
+
+
+# -------------------------
+# FastAPI Dashboard & Endpoints (reprobe manual only)
+# -------------------------
+app = FastAPI(title="Attendance Dashboard")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+def load_attendance_df():
+    try:
+        df = pd.read_csv(ATTENDANCE_FILE)
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=['Name', 'Date', 'Time'])
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
+    template_file = os.path.join(TEMPLATES_DIR, "dashboard_realtime.html")
+    if os.path.exists(template_file):
+        return templates.TemplateResponse("dashboard_realtime.html", {"request": request})
+    else:
+        df = load_attendance_df()
+        if df.empty:
+            html = "<h3>No attendance data yet.</h3>"
+        else:
+            df2 = df.copy()
+            df2['Date'] = df2['Date'].dt.strftime('%Y-%m-%d')
+            html_table = df2.to_html(index=False)
+            html = f"<h3>Attendance Data</h3>{html_table}"
+        return HTMLResponse(f"<html><body>{html}</body></html>")
+
+@app.get("/attendance")
+def attendance_data():
+    df = load_attendance_df()
+    if df.empty:
+        return JSONResponse({
+            "total_students": 0,
+            "today_attendance": 0,
+            "today_absent": 0,
+            "attendance_percentage": {},
+            "engage_json": {"students": [], "counts": [], "total_days": 0},
+            "heatmap_matrix": [],
+            "heatmap_students": [],
+            "heatmap_dates": []
+        })
+
+    total_students = int(df['Name'].nunique())
+    df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d')
+    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+    today_present_students = df[df['Date_str'] == today_str]['Name'].unique().tolist()
+    today_attendance = len(today_present_students)
+    today_absent = max(total_students - today_attendance, 0)
+
+    unique_dates = sorted(df['Date_str'].unique())
+    attendance_percentage = {}
+    for student in df['Name'].unique():
+        count = len(df[df['Name'] == student])
+        attendance_percentage[student] = (count / len(unique_dates)) * 100 if len(unique_dates) > 0 else 0
+
+    engagement = df['Name'].value_counts().reset_index()
+    engagement.columns = ['Name', 'Attendance Count']
+    engage_json = {
+        "students": engagement['Name'].tolist(),
+        "counts": engagement['Attendance Count'].tolist(),
+        "total_days": len(unique_dates)
+    }
+
+    heatmap_students = sorted(df['Name'].unique().tolist())
+    heatmap_dates = unique_dates
+    heatmap_matrix = []
+    for student in heatmap_students:
+        row = []
+        for d in heatmap_dates:
+            present = not df[(df['Name'] == student) & (df['Date_str'] == d)].empty
+            row.append(1 if present else 0)
+        heatmap_matrix.append(row)
+
+    return JSONResponse({
+        "total_students": total_students,
+        "today_attendance": today_attendance,
+        "today_absent": today_absent,
+        "attendance_percentage": attendance_percentage,
+        "engage_json": engage_json,
+        "heatmap_matrix": heatmap_matrix,
+        "heatmap_students": heatmap_students,
+        "heatmap_dates": heatmap_dates
+    })
+
+# Cameras listing endpoint (index & friendly name)
+@app.get("/cameras")
+def cameras_list():
+    cams = CAM.get_available()
+    out = [{"index": i, "name": CAM.get_name(i)} for i in cams]
+    return JSONResponse({"cameras": out, "current": CAM.get_index()})
+
+# Switch camera by index
+@app.post("/camera/{index}")
+def set_camera(index: int):
+    ok = CAM.open(index)
+    return JSONResponse({"success": bool(ok), "camera_index": CAM.get_index(), "camera_name": CAM.get_name(CAM.get_index())})
+
+# Re-probe cameras endpoint (manual trigger only)
+@app.post("/cameras/probe")
+def cameras_probe():
+    new_list = CAM.reprobe()
+    return JSONResponse({
+        "cameras": [{"index": i, "name": CAM.get_name(i)} for i in new_list],
+        "current": CAM.get_index()
+    })
+
+@app.post("/reload")
+def reload_encodings():
+    load_dataset()
+    return {"status": "ok", "known_faces": len(student_names)}
+
+def run_dashboard():
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+
+# -------------------------
+# Face recognition main loop
+# -------------------------
+def face_recognition_loop():
+    print("Starting Attendance System (webcam). Press 'r' to register, 'q' to quit.")
+    while True:
+        ret, frame = CAM.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+        boxes = face_recognition.face_locations(rgb_small, model=ENCODING_MODEL)
+        encs = face_recognition.face_encodings(rgb_small, boxes)
+
+        unknown_present = False
+
+        for enc, box in zip(encs, boxes):
+            if len(student_encodings) == 0:
+                name = "Unknown"
+                unknown_present = True
+            else:
+                matches = face_recognition.compare_faces(student_encodings, enc, tolerance=0.5)
+                distances = face_recognition.face_distance(student_encodings, enc)
+                name = "Unknown"
+                if True in matches:
+                    best_idx = np.argmin(distances)
+                    name = student_names[best_idx]
+                    mark_attendance(name)
+                else:
+                    unknown_present = True
+
+            # scale box coords back up
+            top, right, bottom, left = [v * 4 for v in box]
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
+            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        cam_idx = CAM.get_index()
+        cam_name = CAM.get_name(cam_idx)
+        cv2.putText(frame, f"{cam_name} ({cam_idx})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+        cv2.imshow("Attendance System", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            if unknown_present:
+                print("[INFO] Registration triggered (interactive). Please enter name in terminal.")
+                register_student_interactive()
+            else:
+                print("[INFO] No unknown face detected. Cannot register.")
+        elif key == ord("n"):
+            av = CAM.get_available()
+            if av:
+                try:
+                    cur = CAM.get_index()
+                    pos = av.index(cur) if cur in av else -1
+                    new = av[(pos + 1) % len(av)] if av else cur
+                    CAM.open(new)
+                except Exception:
+                    pass
+        elif key == ord("b"):
+            av = CAM.get_available()
+            if av:
+                try:
+                    cur = CAM.get_index()
+                    pos = av.index(cur) if cur in av else 0
+                    new = av[(pos - 1) % len(av)] if av else cur
+                    CAM.open(new)
+                except Exception:
+                    pass
+
+    CAM.release()
+    cv2.destroyAllWindows()
+
+# -------------------------
+# Main: run dashboard thread + webcam loop
+# -------------------------
+if __name__ == "__main__":
+    # Start FastAPI dashboard in a daemon thread
+    dash_thread = threading.Thread(target=run_dashboard, daemon=True)
+    dash_thread.start()
+
+    # Run the main webcam attendance loop in main thread
+    face_recognition_loop()
+
+    print("[INFO] Exiting program. Dashboard will stop as process ends.")
